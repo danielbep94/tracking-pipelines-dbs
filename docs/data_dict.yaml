@@ -1,0 +1,98 @@
+dataset:
+  name: ceo_asistencia
+  pipeline_name: CEO_ASISTENCIA
+  description: Monthly employee attendance snapshot used by the CEO Asistencia process.
+  source_type: complete_monthly_csv_snapshot
+  source_location: dbfs:/FileStore/tables/rh_danone/incoming/
+  source_filename_pattern: CEO_ASISTENCIA_<MM>_<YYYY>.csv
+  staging_table_pattern: hive_metastore.RH_DANONE.ceo_asistencia_<MM>_<YYYY>
+  curated_delta_table: hive_metastore.default.fact_ceo_asistencia
+  target_table: PRD_MDP.MDP_STG.FACT_CEO_ASISTENCIA
+  reference_source: historical non_null AREA mappings from the target table
+  period_columns: [ANIO, NUM_MES]
+  row_grain: business_confirmation_required
+  candidate_key: business_confirmation_required
+  physical_primary_key_enforced: false
+  load_strategy: replace_period_with_complete_monthly_snapshot
+  idempotency_evidence:
+    code_reviewed: true
+    runtime_same_period_rerun_validated: false
+  schema_authority:
+    configured_columns: conf/settings.py CEO_ASISTENCIA_TARGET_SCHEMA
+    runtime_target: PRD_MDP.MDP_STG.FACT_CEO_ASISTENCIA
+    validation_status: code_derived_target_not_introspected_by_this_change
+
+columns:
+  - {name: ID, type: STRING, nullable: target_defined, description: "Source attendance or employee identifier; uniqueness is not established."}
+  - {name: EMPRESA, type: SOURCE_INFERRED, nullable: target_defined, description: "Company associated with the employee attendance record; physical type must be confirmed from the live target."}
+  - {name: NUMERO_EMPLEADO, type: STRING, nullable: target_defined, description: "Employee number normalized to an eight-character string."}
+  - {name: PATERNO, type: SOURCE_INFERRED, nullable: target_defined, description: "Employee paternal surname; physical type is inherited from the source."}
+  - {name: MATERNO, type: SOURCE_INFERRED, nullable: target_defined, description: "Employee maternal surname; physical type is inherited from the source."}
+  - {name: NOMBRE, type: SOURCE_INFERRED, nullable: target_defined, description: "Employee given name; physical type is inherited from the source."}
+  - {name: AREA, type: STRING, nullable: target_defined, description: "Source area when available; otherwise enriched from historical target mappings."}
+  - {name: FECHA, type: DATE, nullable: target_defined, description: "Attendance date parsed from the source."}
+  - {name: REGISTRO_1, type: SOURCE_INFERRED, nullable: target_defined, description: "First attendance registration value retained with its inferred source type."}
+  - {name: REGISTRO_2, type: SOURCE_INFERRED, nullable: target_defined, description: "Second attendance registration value retained with its inferred source type."}
+  - {name: ANIO, type: INTEGER, nullable: target_defined, description: "Calendar year derived from FECHA and validated against the filename."}
+  - {name: NUM_MES, type: INTEGER, nullable: target_defined, description: "Calendar month derived from FECHA and validated against the filename."}
+  - {name: WEEK_NUMBER, type: INTEGER, nullable: target_defined, description: "Spark week-of-year derived from FECHA."}
+  - {name: DAY, type: STRING, nullable: target_defined, description: "Day name derived from FECHA using the Spark runtime locale."}
+  - {name: RESULTADO, type: INTEGER, nullable: target_defined, description: "Current code sets 1 when both registrations exist and the first registration hour is at least 06:00; otherwise 0."}
+  - {name: DIFERENCIA_HORAS, type: DOUBLE, nullable: target_defined, description: "Hours between REGISTRO_1 and REGISTRO_2 when RESULTADO is 1."}
+
+business_metrics:
+  - name: TARGET_ROWS
+    aggregation: count
+    classification: additive_count
+    status: implemented
+  - name: NON_NULL_EMPLOYEE_COUNT
+    aggregation: count_non_null_NUMERO_EMPLEADO
+    classification: additive_count
+    status: implemented
+  - name: DISTINCT_EMPLOYEE_COUNT
+    aggregation: count_distinct_NUMERO_EMPLEADO
+    classification: non_additive_distinct_count
+    status: implemented
+  - name: NULL_EMPLOYEE_COUNT
+    aggregation: count_null_NUMERO_EMPLEADO
+    classification: additive_count
+    status: implemented
+  - name: DISTINCT_ID_COUNT
+    aggregation: count_distinct_ID
+    classification: non_additive_distinct_count
+    status: implemented
+  - name: DISTINCT_AREA_COUNT
+    aggregation: count_distinct_AREA
+    classification: non_additive_distinct_count
+    status: implemented
+  - name: VALID_ATTENDANCE_COUNT
+    aggregation: count_RESULTADO_equals_1
+    classification: additive_count
+    status: implemented
+  - name: TOTAL_OR_AVERAGE_HOURS
+    aggregation: business_confirmation_required
+    classification: potentially_additive_measure
+    status: not_implemented
+    reason: overnight_shifts_negative_durations_and_business_aggregation_rules_not_confirmed
+
+data_quality_rules:
+  - Canonical filename must provide a valid month and year.
+  - Exactly one CSV may be processed per execution.
+  - Source and staging row counts must match.
+  - Required identity, date and registration columns must exist.
+  - Column normalization must not produce duplicates.
+  - No source rows may be silently dropped during transformation.
+  - Every transformed FECHA must match the filename ANIO and NUM_MES.
+  - Output columns follow the configured 16-column target contract.
+  - Final Delta and Snowflake period rows must equal transformed rows.
+
+open_questions:
+  - Confirm the official business purpose and consumers of CEO Asistencia.
+  - Confirm the business row grain and logical or composite unique key.
+  - Confirm the authoritative AREA mapping when an employee has multiple historical areas.
+  - Confirm whether RESULTADO correctly represents valid attendance in all shift patterns.
+  - Confirm how overnight shifts and negative DIFERENCIA_HORAS values must be handled.
+  - Confirm the Spark locale required for DAY.
+  - Confirm target types and nullability against live Snowflake metadata.
+  - Confirm downstream Power BI reports, business owners, monthly volume and SLA.
+  - Confirm whether failed inputs should be quarantined instead of deleted.

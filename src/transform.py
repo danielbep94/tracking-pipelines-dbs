@@ -1,84 +1,153 @@
-# src/transform.py
-from pyspark.sql import DataFrame
+"""CEO Asistencia normalization, attendance derivation, and AREA enrichment."""
+
+import re
+import unicodedata
+
 import pyspark.sql.functions as F
-from pyspark.sql.types import IntegerType, DoubleType
-from logs.logger import get_logger
+from pyspark.sql.types import DoubleType, IntegerType, StringType
+
 from conf.settings import FINAL_COLUMNS
+from logs.logger import get_logger
 
-logger = get_logger(__name__)
 
-def clean_and_transform(df: DataFrame, df_ref: DataFrame, target_year: int, target_month: int) -> DataFrame:
-    logger.info("Starting transformations")
-    
-    # 1. Clean column names
-    df = df.select([F.col(c).alias(c.strip().upper().replace(" ", "_")) for c in df.columns])
-    if "NUM_EMPLEADO" in df.columns:
-        df = df.withColumnRenamed("NUM_EMPLEADO", "NUMERO_EMPLEADO")
+logger = get_logger("Transform")
 
-    # 2. Date parsing (Handles multiple formats using coalesce)
-    df = df.withColumn(
+REQUIRED_SOURCE_COLUMNS = {
+    "ID",
+    "EMPRESA",
+    "NUMERO_EMPLEADO",
+    "PATERNO",
+    "MATERNO",
+    "NOMBRE",
+    "FECHA",
+    "REGISTRO_1",
+    "REGISTRO_2",
+}
+
+
+def normalize_column_name(name: str) -> str:
+    """Return an uppercase, accent-free, underscore-delimited column name."""
+    decomposed = unicodedata.normalize("NFKD", str(name))
+    ascii_only = decomposed.encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", ascii_only)
+    return re.sub(r"_+", "_", cleaned).strip("_").upper()
+
+
+def _normalize_layout(dataframe):
+    normalized = [normalize_column_name(name) for name in dataframe.columns]
+    duplicates = sorted(
+        {name for name in normalized if normalized.count(name) > 1}
+    )
+    if duplicates:
+        raise ValueError(
+            f"Column normalization produced duplicate columns: {duplicates}"
+        )
+    dataframe = dataframe.toDF(*normalized)
+    if "NUM_EMPLEADO" in dataframe.columns and "NUMERO_EMPLEADO" in dataframe.columns:
+        raise ValueError(
+            "Source contains both NUM_EMPLEADO and NUMERO_EMPLEADO."
+        )
+    if "NUM_EMPLEADO" in dataframe.columns:
+        dataframe = dataframe.withColumnRenamed(
+            "NUM_EMPLEADO",
+            "NUMERO_EMPLEADO",
+        )
+    missing = sorted(REQUIRED_SOURCE_COLUMNS - set(dataframe.columns))
+    if missing:
+        raise ValueError(f"Required source columns are missing: {missing}")
+    if "AREA" not in dataframe.columns:
+        dataframe = dataframe.withColumn("AREA", F.lit(None).cast(StringType()))
+    return dataframe
+
+
+def clean_and_transform(dataframe, reference_dataframe):
+    """Apply the 16-column attendance output contract without dropping rows."""
+    logger.info("Starting CEO Asistencia transformations")
+    dataframe = _normalize_layout(dataframe)
+
+    dataframe = dataframe.withColumn(
         "FECHA_CLEAN",
         F.coalesce(
             F.to_date(F.col("FECHA"), "dd/MM/yyyy"),
-            F.to_date(F.col("FECHA"), "yyyy-MM-dd")
+            F.to_date(F.col("FECHA"), "yyyy-MM-dd"),
+        ),
+    )
+    dataframe = (
+        dataframe.withColumn("ANIO", F.year(F.col("FECHA_CLEAN")))
+        .withColumn("NUM_MES", F.month(F.col("FECHA_CLEAN")))
+        .withColumn(
+            "NUMERO_EMPLEADO",
+            F.lpad(
+                F.col("NUMERO_EMPLEADO").cast(IntegerType()).cast("string"),
+                8,
+                "0",
+            ),
+        )
+        .withColumn("ID", F.col("ID").cast("string"))
+        .withColumn("WEEK_NUMBER", F.weekofyear(F.col("FECHA_CLEAN")))
+        .withColumn("DAY", F.date_format(F.col("FECHA_CLEAN"), "EEEE"))
+    )
+
+    dataframe = (
+        dataframe.withColumn("REG1_TS", F.to_timestamp(F.col("REGISTRO_1")))
+        .withColumn("REG2_TS", F.to_timestamp(F.col("REGISTRO_2")))
+        .withColumn(
+            "RESULTADO",
+            F.when(
+                F.col("REG1_TS").isNotNull()
+                & F.col("REG2_TS").isNotNull()
+                & (F.hour(F.col("REG1_TS")) >= 6),
+                1,
+            ).otherwise(0),
+        )
+        .withColumn(
+            "DIFERENCIA_HORAS",
+            F.when(
+                F.col("RESULTADO") == 1,
+                F.round(
+                    (
+                        F.unix_timestamp("REG2_TS")
+                        - F.unix_timestamp("REG1_TS")
+                    )
+                    / 3600,
+                    2,
+                ),
+            ).otherwise(F.lit(None).cast(DoubleType())),
         )
     )
 
-    # 3. Filter early to target period
-    df = df.withColumn("ANIO", F.year(F.col("FECHA_CLEAN"))) \
-           .withColumn("NUM_MES", F.month(F.col("FECHA_CLEAN")))
-           
-    df = df.filter((F.col("ANIO") == target_year) & (F.col("NUM_MES") == target_month))
-
-    # 4. Standardize strings and formats
-    df = df.withColumn("NUMERO_EMPLEADO", F.lpad(F.col("NUMERO_EMPLEADO").cast(IntegerType()).cast("string"), 8, "0")) \
-           .withColumn("ID", F.col("ID").cast("string")) \
-           .withColumn("WEEK_NUMBER", F.weekofyear(F.col("FECHA_CLEAN"))) \
-           .withColumn("DAY", F.date_format(F.col("FECHA_CLEAN"), "EEEE")) 
-
-    # 5. Handle Times (Assuming REGISTRO_1 and REGISTRO_2 are datetime strings)
-    df = df.withColumn("REG1_TS", F.to_timestamp(F.col("REGISTRO_1"))) \
-           .withColumn("REG2_TS", F.to_timestamp(F.col("REGISTRO_2")))
-
-    # 6. Calculate RESULTADO and DIFERENCIA_HORAS
-    df = df.withColumn(
-        "RESULTADO",
-        F.when(
-            F.col("REG1_TS").isNotNull() & 
-            F.col("REG2_TS").isNotNull() & 
-            (F.hour(F.col("REG1_TS")) >= 6), 
-            1
-        ).otherwise(0)
+    reference_clean = (
+        reference_dataframe.withColumn(
+            "NUMERO_EMPLEADO",
+            F.lpad(
+                F.col("NUMERO_EMPLEADO").cast(IntegerType()).cast("string"),
+                8,
+                "0",
+            ),
+        )
+        .withColumn("ID", F.col("ID").cast("string"))
+        .select(
+            "NUMERO_EMPLEADO",
+            "ID",
+            F.col("AREA").alias("REFERENCE_AREA"),
+        )
+        .dropDuplicates(["NUMERO_EMPLEADO", "ID"])
     )
-
-    df = df.withColumn(
-        "DIFERENCIA_HORAS",
-        F.when(
-            F.col("RESULTADO") == 1,
-            F.round((F.unix_timestamp("REG2_TS") - F.unix_timestamp("REG1_TS")) / 3600, 2)
-        ).otherwise(F.lit(None).cast(DoubleType()))
-    )
-
-    # 7. Enrich AREA from Snowflake reference
-    df_ref_clean = df_ref.withColumn("NUMERO_EMPLEADO", F.lpad(F.col("NUMERO_EMPLEADO").cast(IntegerType()).cast("string"), 8, "0")) \
-                         .withColumn("ID", F.col("ID").cast("string")) \
-                         .dropDuplicates(["NUMERO_EMPLEADO", "ID"])
-
-    df = df.alias("a").join(
-        df_ref_clean.alias("b"),
+    dataframe = dataframe.join(
+        reference_clean,
         on=["NUMERO_EMPLEADO", "ID"],
-        how="left"
+        how="left",
     )
-    
-    if "AREA" in df.columns and "b.AREA" in df.columns:
-        df = df.withColumn("FINAL_AREA", F.coalesce(F.col("a.AREA"), F.col("b.AREA")))
-    else:
-        df = df.withColumn("FINAL_AREA", F.col("b.AREA"))
-    
-    df = df.withColumn("AREA", F.col("FINAL_AREA"))
+    source_area = F.when(
+        F.trim(F.col("AREA").cast("string")) == "",
+        F.lit(None),
+    ).otherwise(F.col("AREA"))
+    dataframe = dataframe.withColumn(
+        "AREA",
+        F.coalesce(source_area, F.col("REFERENCE_AREA")),
+    )
 
-    # 8. Final select and cast
-    df_final = df.withColumn("FECHA", F.col("FECHA_CLEAN")) \
-                 .select(*[F.col(c) for c in FINAL_COLUMNS])
-
-    return df_final
+    return (
+        dataframe.withColumn("FECHA", F.col("FECHA_CLEAN"))
+        .select(*[F.col(column_name) for column_name in FINAL_COLUMNS])
+    )

@@ -1,57 +1,151 @@
-# src/load.py
-from pyspark.sql import DataFrame, SparkSession
+"""Period-idempotent Delta and Snowflake loads for CEO Asistencia."""
+
+from typing import Dict
+
+from conf import settings
 from logs.logger import get_logger
-from conf.settings import TARGET_HIVE_TABLE, TARGET_SNOWFLAKE_TABLE
 
-logger = get_logger(__name__)
 
-def load_to_delta(spark: SparkSession, df: DataFrame, year: int, month: int, insert_count: int):
-    logger.info(f"Loading to Delta Lake: {TARGET_HIVE_TABLE} for {year}-{month:02d}")
-    replace_condition = f"ANIO = {year} AND NUM_MES = {month}"
-    
-    # Write using replaceWhere
-    df.write \
-      .format("delta") \
-      .mode("overwrite") \
-      .option("replaceWhere", replace_condition) \
-      .saveAsTable(TARGET_HIVE_TABLE)
-      
-    logger.info(f"✅ Inserted/Replaced {insert_count} rows in Delta table.")
-    
-    # Fetch final table count
-    try:
-        total_count = spark.read.table(TARGET_HIVE_TABLE).count()
-        logger.info(f"📊 Total rows in Delta {TARGET_HIVE_TABLE} after load: {total_count}")
-    except Exception as e:
-        logger.warning(f"Could not retrieve total count for Delta table: {e}")
+logger = get_logger("Load")
 
-def load_to_snowflake(spark: SparkSession, df: DataFrame, sf_options: dict, year: int, month: int, insert_count: int):
-    logger.info(f"Loading to Snowflake: {TARGET_SNOWFLAKE_TABLE} for {year}-{month:02d}")
-    
-    # 1. Fetch count of rows to be deleted
-    try:
-        query_before = f"SELECT COUNT(*) as CNT FROM {TARGET_SNOWFLAKE_TABLE} WHERE ANIO = {year} AND NUM_MES = {month}"
-        rows_to_delete = spark.read.format("snowflake").options(**sf_options).option("query", query_before).load().collect()[0]["CNT"]
-        logger.info(f"🧹 Rows to be deleted in Snowflake (target period): {rows_to_delete}")
-    except Exception as e:
-        logger.warning(f"Could not fetch rows to delete: {e}")
 
-    # 2. Perform write with preactions
-    delete_statement = f"DELETE FROM {TARGET_SNOWFLAKE_TABLE} WHERE ANIO = {year} AND NUM_MES = {month}"
-    df.write \
-      .format("snowflake") \
-      .options(**sf_options) \
-      .option("dbtable", TARGET_SNOWFLAKE_TABLE) \
-      .option("preactions", delete_statement) \
-      .mode("append") \
-      .save()
-      
-    logger.info(f"✅ Inserted {insert_count} rows into Snowflake.")
+def _validate_period(target_year: int, target_month: int) -> None:
+    if not isinstance(target_year, int) or not 1900 <= target_year <= 9999:
+        raise ValueError("target_year must be a four-digit integer.")
+    if not isinstance(target_month, int) or not 1 <= target_month <= 12:
+        raise ValueError("target_month must be an integer from 1 to 12.")
 
-    # 3. Fetch final total count
-    try:
-        query_after = f"SELECT COUNT(*) as CNT FROM {TARGET_SNOWFLAKE_TABLE}"
-        total_rows = spark.read.format("snowflake").options(**sf_options).option("query", query_after).load().collect()[0]["CNT"]
-        logger.info(f"📊 Total rows in Snowflake {TARGET_SNOWFLAKE_TABLE} after load: {total_rows}")
-    except Exception as e:
-        logger.warning(f"Could not fetch final Snowflake total count: {e}")
+
+def count_delta_period(spark, target_year: int, target_month: int) -> int:
+    """Count one period in the curated Delta target."""
+    _validate_period(target_year, target_month)
+    return int(
+        spark.table(settings.HIVE_FULL_TABLE)
+        .where(
+            f"ANIO = {target_year} AND NUM_MES = {target_month}"
+        )
+        .count()
+    )
+
+
+def count_snowflake_period(
+    spark,
+    snowflake_options: Dict[str, str],
+    target_year: int,
+    target_month: int,
+) -> int:
+    """Count one period in the permanent Snowflake target."""
+    _validate_period(target_year, target_month)
+    query = f"""
+        SELECT COUNT(*) AS TARGET_ROWS
+        FROM {settings.SNOWFLAKE_FULL_TABLE}
+        WHERE TRY_TO_NUMBER(ANIO) = {target_year}
+          AND TRY_TO_NUMBER(NUM_MES) = {target_month}
+    """
+    row = (
+        spark.read.format(settings.SNOWFLAKE_SOURCE_NAME)
+        .options(**snowflake_options)
+        .option("query", query)
+        .load()
+        .first()
+    )
+    if row is None:
+        raise RuntimeError("Snowflake period row-count query returned no row.")
+    return int(row[0])
+
+
+def load_to_delta(
+    spark,
+    dataframe,
+    target_year: int,
+    target_month: int,
+    expected_rows: int,
+) -> int:
+    """Replace one curated Delta period and validate its final count."""
+    _validate_period(target_year, target_month)
+    if int(expected_rows) <= 0:
+        raise ValueError("Cannot load an empty CEO Asistencia DataFrame.")
+
+    replace_condition = (
+        f"ANIO = {target_year} AND NUM_MES = {target_month}"
+    )
+    logger.info(
+        "Replacing Delta period | table=%s | period=%s/%02d | rows=%s",
+        settings.HIVE_FULL_TABLE,
+        target_year,
+        target_month,
+        f"{expected_rows:,}",
+    )
+    (
+        dataframe.write.format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", replace_condition)
+        .saveAsTable(settings.HIVE_FULL_TABLE)
+    )
+    actual_rows = count_delta_period(spark, target_year, target_month)
+    if actual_rows != expected_rows:
+        raise RuntimeError(
+            "Delta post-load validation failed. "
+            f"Expected {expected_rows:,} rows for "
+            f"{target_year}/{target_month:02d}, but found {actual_rows:,}."
+        )
+    logger.info("Delta load validated | rows=%s", f"{actual_rows:,}")
+    return actual_rows
+
+
+def load_to_snowflake(
+    spark,
+    dataframe,
+    snowflake_options: Dict[str, str],
+    target_year: int,
+    target_month: int,
+    expected_rows: int,
+) -> int:
+    """Replace one Snowflake period and validate its final count."""
+    _validate_period(target_year, target_month)
+    if int(expected_rows) <= 0:
+        raise ValueError("Cannot load an empty CEO Asistencia DataFrame.")
+
+    delete_statement = (
+        f"DELETE FROM {settings.SNOWFLAKE_FULL_TABLE} "
+        f"WHERE TRY_TO_NUMBER(ANIO) = {target_year} "
+        f"AND TRY_TO_NUMBER(NUM_MES) = {target_month}"
+    )
+    connector_options = dict(snowflake_options)
+    connector_options.update(
+        {
+            "column_mapping": "name",
+            "column_mismatch_behavior": "error",
+            "continue_on_error": "off",
+            "truncate_columns": "off",
+        }
+    )
+    logger.info(
+        "Replacing Snowflake period | table=%s | period=%s/%02d | rows=%s",
+        settings.SNOWFLAKE_FULL_TABLE,
+        target_year,
+        target_month,
+        f"{expected_rows:,}",
+    )
+    (
+        dataframe.write.format(settings.SNOWFLAKE_SOURCE_NAME)
+        .options(**connector_options)
+        .option("dbtable", settings.SNOWFLAKE_TABLE)
+        .option("preactions", delete_statement)
+        .mode("append")
+        .save()
+    )
+    actual_rows = count_snowflake_period(
+        spark=spark,
+        snowflake_options=snowflake_options,
+        target_year=target_year,
+        target_month=target_month,
+    )
+    if actual_rows != expected_rows:
+        raise RuntimeError(
+            "Snowflake post-load validation failed. "
+            f"Expected {expected_rows:,} rows for "
+            f"{target_year}/{target_month:02d}, but found {actual_rows:,}."
+        )
+    logger.info("Snowflake load validated | rows=%s", f"{actual_rows:,}")
+    return actual_rows
