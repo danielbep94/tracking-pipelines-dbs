@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTest & Unit Test outputs
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment / IDE / OS metadata
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & temp files
+*.log
+scratch/
