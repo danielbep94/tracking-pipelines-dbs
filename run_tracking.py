@@ -2,7 +2,17 @@
 Reusable append-only pipeline run tracking for Databricks and Snowflake.
 
 This standalone module provides run context management, metrics tracking,
-and telemetry logging to Snowflake tables (e.g. PRD_MDP.MDP_STG.PIPELINE_RUNS).
+lightweight DataFrame profiling, lightweight DQ checks, runtime metadata
+collection, and telemetry logging to Snowflake tables
+(e.g. PRD_MDP.MDP_STG.PIPELINE_RUNS).
+
+Design principles
+-----------------
+* One Databricks job execution  ->  one row in PIPELINE_RUNS.
+* BUSINESS_METRICS_JSON is the single extensibility point for all additional
+  profiling metrics, reconciliation values, DQ summaries, and business KPIs.
+* No additional Snowflake tables are introduced.
+* All public names and call signatures remain backward-compatible.
 """
 
 import base64
@@ -12,7 +22,7 @@ from decimal import Decimal
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 _MAX_ERROR_LENGTH = 4000
@@ -23,6 +33,10 @@ _SENSITIVE_ASSIGNMENT = re.compile(
 
 logger = logging.getLogger("run_tracking")
 
+
+# ---------------------------------------------------------------------------
+# Core utilities
+# ---------------------------------------------------------------------------
 
 def utc_now() -> datetime:
     """Return current UTC datetime with timezone info."""
@@ -96,7 +110,7 @@ def _json_default(value: object) -> object:
 
 
 def metrics_to_json(metrics: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Serialize business metrics dictionary to a formatted JSON string."""
+    """Serialize business metrics dictionary to a compact JSON string."""
     if not metrics:
         return None
     return json.dumps(
@@ -107,6 +121,10 @@ def metrics_to_json(metrics: Optional[Dict[str, Any]]) -> Optional[str]:
         separators=(",", ":"),
     )
 
+
+# ---------------------------------------------------------------------------
+# Databricks / Snowflake helpers
+# ---------------------------------------------------------------------------
 
 def get_widget_value(dbutils, name: str, default: Optional[str] = None) -> Optional[str]:
     """Safely fetch a Databricks widget parameter if available."""
@@ -138,6 +156,51 @@ def get_databricks_context_tag(dbutils, tag_name: str) -> Optional[str]:
         pass
     return None
 
+
+def _collect_runtime_metadata(spark=None, dbutils=None) -> Dict[str, Any]:
+    """
+    Collect Databricks/Spark runtime metadata for inclusion in BUSINESS_METRICS_JSON.
+
+    All keys are prefixed with ``runtime_`` so they never clash with user-defined
+    metrics.  Returns an empty dict if metadata cannot be read.
+    """
+    meta: Dict[str, Any] = {}
+    try:
+        if spark is not None:
+            try:
+                meta["runtime_spark_version"] = spark.version
+            except Exception:
+                pass
+            try:
+                meta["runtime_cluster_id"] = spark.conf.get(
+                    "spark.databricks.clusterUsageTags.clusterId", None
+                )
+            except Exception:
+                pass
+
+        if dbutils is not None:
+            try:
+                context_json = (
+                    dbutils.notebook.entry_point
+                    .getDbutils().notebook().getContext().toJson()
+                )
+                ctx = json.loads(context_json)
+                tags = ctx.get("tags", {})
+                extra = ctx.get("extraContext", {})
+                for src_key, dst_key in (
+                    ("notebookPath",    "runtime_notebook_path"),
+                    ("gitCommit",       "runtime_git_sha"),
+                    ("browserHostName", "runtime_host"),
+                ):
+                    val = tags.get(src_key) or extra.get(src_key)
+                    if val:
+                        meta[dst_key] = str(val).strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {k: v for k, v in meta.items() if v is not None}
 
 
 def _encode_private_key_for_spark(private_key_pem: str) -> str:
@@ -214,6 +277,58 @@ def get_snowflake_options(
         "sfRole": role,
     }
 
+
+def tag_snowflake_session(
+    spark,
+    snowflake_options: Dict[str, str],
+    run_id: str,
+    pipeline_name: str,
+    pipeline_version: Optional[str] = None,
+) -> None:
+    """
+    Tag the active Snowflake session with RUN_ID, PIPELINE_NAME, and PIPELINE_VERSION
+    for Snowflake QUERY_HISTORY auditing.
+
+    Best-effort: any failure is logged and silently suppressed so it never
+    interrupts business execution.
+
+    Example::
+
+        tag_snowflake_session(
+            spark=spark,
+            snowflake_options=sf_options,
+            run_id=tracker.context.run_id,
+            pipeline_name="FACT_SALES_OTC",
+            pipeline_version="1.2.0",
+        )
+    """
+    try:
+        tag_payload = json.dumps(
+            {
+                "run_id": run_id,
+                "pipeline_name": pipeline_name,
+                "pipeline_version": pipeline_version or "unversioned",
+            },
+            separators=(",", ":"),
+        )
+        query = f"ALTER SESSION SET QUERY_TAG = '{tag_payload}'"
+        (
+            spark.read.format("net.snowflake.spark.snowflake")
+            .options(**snowflake_options)
+            .option("query", query)
+            .load()
+        )
+    except Exception as tag_err:
+        logger.warning(
+            "SNOWFLAKE_TAG_FAILED | %s: %s",
+            type(tag_err).__name__,
+            sanitize_error_message(tag_err),
+        )
+
+
+# ---------------------------------------------------------------------------
+# RunContext
+# ---------------------------------------------------------------------------
 
 @dataclass
 class RunContext:
@@ -298,6 +413,10 @@ class RunContext:
             "CREATED_AT_UTC": completed_at,
         }
 
+
+# ---------------------------------------------------------------------------
+# Snowflake write helpers
+# ---------------------------------------------------------------------------
 
 def read_snowflake_metrics(
     spark,
@@ -406,20 +525,50 @@ def append_run_record_safely(
         return False
 
 
+# ---------------------------------------------------------------------------
+# RunTracker
+# ---------------------------------------------------------------------------
+
 class RunTracker:
     """
     Context manager for effortless run tracking in Databricks notebooks.
 
-    Usage:
-        with run_tracking(
+    Design
+    ------
+    * One Databricks job execution produces exactly one row in PIPELINE_RUNS.
+    * Core execution details (RUN_ID, timestamps, duration, status, errors) are
+      captured automatically.
+    * Row count fields default to None (NULL in Snowflake) to avoid unnecessary
+      PySpark .count() overhead.  Assign them only when business requires it.
+    * All additional metrics, profiling results, DQ summaries, and runtime
+      metadata are stored inside BUSINESS_METRICS_JSON.
+
+    Usage (explicit finish)::
+
+        tracker = run_tracking(
             spark=spark,
             snowflake_options=sf_opts,
-            pipeline_name="MY_JOB",
-            table_name="PRD_MDP.MDP_STG.PIPELINE_RUNS",
+            pipeline_name="FACT_SALES_OTC",
             dbutils=dbutils,
-        ) as tracker:
-            tracker.source_rows = 500
-            # pipeline logic...
+        )
+
+        # pipeline logic ...
+
+        # Optional: lightweight profiling
+        profile = tracker.profile(df_source, sum_columns=["KILOS"], key_columns=["ID"])
+        tracker.add_metrics(profile)
+
+        # Optional: DQ checks
+        tracker.check(df_target.filter("KILOS < 0").count() == 0, "no_negative_kilos")
+        tracker.check(df_target.filter("KILOS IS NULL").count() == 0, "no_null_kilos")
+
+        tracker.finish()
+
+    Usage (context manager)::
+
+        with run_tracking(spark=spark, ...) as tracker:
+            # pipeline logic ...
+            pass
     """
 
     def __init__(
@@ -438,6 +587,7 @@ class RunTracker:
         period_end_date: Optional[date] = None,
         enabled: bool = True,
         log_obj: Optional[logging.Logger] = None,
+        collect_runtime_metadata: bool = True,
     ):
         self.spark = spark
         self.snowflake_options = snowflake_options
@@ -454,12 +604,19 @@ class RunTracker:
         self.period_start_date = period_start_date
         self.period_end_date = period_end_date
 
+        # Row count metrics -- default NULL; assign only when business requires it
         self.source_rows: Optional[int] = None
         self.staging_rows: Optional[int] = None
         self.transformed_rows: Optional[int] = None
         self.target_rows_before: Optional[int] = None
         self.target_rows_after: Optional[int] = None
+
+        # BUSINESS_METRICS_JSON payload (extensible key/value store)
         self.business_metrics: Dict[str, Any] = {}
+
+        # DQ check accumulator
+        self._dq_results: List[Dict[str, Any]] = []
+
         self.status: str = "SUCCEEDED"
 
         try:
@@ -505,6 +662,13 @@ class RunTracker:
                 trigger_type=trigger_type,
                 started_at_utc=started_at,
             )
+
+            # Auto-collect runtime metadata into business_metrics
+            if collect_runtime_metadata:
+                runtime_meta = _collect_runtime_metadata(spark=spark, dbutils=dbutils)
+                if runtime_meta:
+                    self.business_metrics.update(runtime_meta)
+
         except Exception as init_err:
             self.logger.error(
                 "TRACKING_INIT_FAILED | %s: %s. Operational telemetry disabled.",
@@ -513,12 +677,226 @@ class RunTracker:
             )
             self.enabled = False
 
+    # ------------------------------------------------------------------
+    # Metric helpers
+    # ------------------------------------------------------------------
+
     def set_metrics(self, **metrics: Any) -> None:
-        """Add custom metrics to the business_metrics dictionary."""
+        """
+        Add or overwrite individual keys in the BUSINESS_METRICS_JSON payload.
+
+        Example::
+
+            tracker.set_metrics(reconciliation_status="PASS", duplicate_rows=0)
+        """
         try:
             self.business_metrics.update(metrics)
         except Exception as err:
             self.logger.warning("Failed to set metrics: %s", err)
+
+    def add_metrics(self, metrics: Dict[str, Any]) -> None:
+        """
+        Merge a dictionary of metrics into the BUSINESS_METRICS_JSON payload.
+
+        Use this to merge profiling results returned by profile().
+
+        Example::
+
+            profile_result = tracker.profile(df, sum_columns=["KILOS"])
+            tracker.add_metrics(profile_result)
+        """
+        try:
+            if metrics:
+                self.business_metrics.update(metrics)
+        except Exception as err:
+            self.logger.warning("Failed to add metrics: %s", err)
+
+    # ------------------------------------------------------------------
+    # Lightweight DataFrame profiling
+    # ------------------------------------------------------------------
+
+    def profile(
+        self,
+        df,
+        *,
+        prefix: str = "",
+        count: bool = True,
+        distinct_columns: Optional[List[str]] = None,
+        key_columns: Optional[List[str]] = None,
+        null_columns: Optional[List[str]] = None,
+        sum_columns: Optional[List[str]] = None,
+        min_columns: Optional[List[str]] = None,
+        max_columns: Optional[List[str]] = None,
+        avg_columns: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute lightweight profiling metrics on a Spark DataFrame and return
+        them as a flat dictionary ready to merge into BUSINESS_METRICS_JSON.
+
+        Metrics are RETURNED, not automatically stored. Call add_metrics() to merge.
+
+        Parameters
+        ----------
+        df          : PySpark DataFrame to profile.
+        prefix      : Optional prefix applied to every key (e.g. "source_").
+        count       : Include row_count (default True).
+        distinct_columns : Columns for {col}_distinct_count.
+        key_columns : Columns used to detect duplicates -> duplicate_count.
+        null_columns: Columns for {col}_null_count and {col}_null_rate.
+        sum_columns : Columns for {col}_sum.
+        min_columns : Columns for {col}_min.
+        max_columns : Columns for {col}_max.
+        avg_columns : Columns for {col}_avg.
+
+        Returns
+        -------
+        Dict[str, Any] of profiling metrics.
+
+        Example::
+
+            profile = tracker.profile(
+                df_source,
+                prefix="source_",
+                sum_columns=["KILOS"],
+                key_columns=["ORDER_ID"],
+                null_columns=["KILOS"],
+            )
+            tracker.add_metrics(profile)
+        """
+        result: Dict[str, Any] = {}
+        p = prefix
+
+        try:
+            from pyspark.sql import functions as F
+
+            agg_exprs = []
+
+            if count:
+                agg_exprs.append(F.count("*").alias("__row_count"))
+
+            for col in (distinct_columns or []):
+                agg_exprs.append(F.countDistinct(col).alias(f"__distinct__{col}"))
+
+            for col in (null_columns or []):
+                agg_exprs.append(
+                    F.sum(F.col(col).isNull().cast("int")).alias(f"__null__{col}")
+                )
+
+            for col in (sum_columns or []):
+                agg_exprs.append(F.sum(col).alias(f"__sum__{col}"))
+
+            for col in (min_columns or []):
+                agg_exprs.append(F.min(col).alias(f"__min__{col}"))
+
+            for col in (max_columns or []):
+                agg_exprs.append(F.max(col).alias(f"__max__{col}"))
+
+            for col in (avg_columns or []):
+                agg_exprs.append(F.avg(col).alias(f"__avg__{col}"))
+
+            if agg_exprs:
+                row = df.agg(*agg_exprs).first()
+                if row:
+                    row_dict = row.asDict()
+
+                    if count:
+                        result[f"{p}row_count"] = row_dict.get("__row_count")
+
+                    for col in (distinct_columns or []):
+                        result[f"{p}{col.lower()}_distinct_count"] = row_dict.get(f"__distinct__{col}")
+
+                    total_rows = result.get(f"{p}row_count") or 0
+                    for col in (null_columns or []):
+                        null_ct = row_dict.get(f"__null__{col}")
+                        result[f"{p}{col.lower()}_null_count"] = null_ct
+                        if total_rows and null_ct is not None:
+                            result[f"{p}{col.lower()}_null_rate"] = round(null_ct / total_rows, 6)
+                        else:
+                            result[f"{p}{col.lower()}_null_rate"] = None
+
+                    for col in (sum_columns or []):
+                        result[f"{p}{col.lower()}_sum"] = row_dict.get(f"__sum__{col}")
+
+                    for col in (min_columns or []):
+                        result[f"{p}{col.lower()}_min"] = row_dict.get(f"__min__{col}")
+
+                    for col in (max_columns or []):
+                        result[f"{p}{col.lower()}_max"] = row_dict.get(f"__max__{col}")
+
+                    for col in (avg_columns or []):
+                        val = row_dict.get(f"__avg__{col}")
+                        result[f"{p}{col.lower()}_avg"] = (
+                            round(float(val), 6) if val is not None else None
+                        )
+
+            # Duplicate count requires a separate groupBy action
+            if key_columns:
+                dup_count = (
+                    df.groupBy(*key_columns)
+                    .count()
+                    .filter(F.col("count") > 1)
+                    .count()
+                )
+                result[f"{p}duplicate_count"] = dup_count
+
+        except Exception as profile_err:
+            self.logger.warning(
+                "PROFILE_FAILED | %s: %s",
+                type(profile_err).__name__,
+                sanitize_error_message(profile_err),
+            )
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Lightweight DQ framework
+    # ------------------------------------------------------------------
+
+    def check(self, condition: bool, name: str) -> bool:
+        """
+        Register a single DQ check result.
+
+        Results are accumulated and written as aggregate counts into
+        BUSINESS_METRICS_JSON (dq_checks_total, dq_checks_passed,
+        dq_checks_failed) automatically at finish() time.
+
+        Parameters
+        ----------
+        condition : Boolean result of the check. True = passed.
+        name      : Human-readable check name (used for logging only).
+
+        Returns
+        -------
+        bool -- the value of condition, so callers can branch on it.
+
+        Example::
+
+            tracker.check(df.filter("KILOS < 0").count() == 0, "no_negative_kilos")
+            tracker.check(df.filter("ID IS NULL").count() == 0, "no_null_ids")
+        """
+        passed = bool(condition)
+        self._dq_results.append({"name": name, "passed": passed})
+        if not passed:
+            self.logger.warning("DQ_CHECK_FAILED | check=%s", name)
+        return passed
+
+    def _flush_dq_summary(self) -> None:
+        """Merge DQ aggregate counts into business_metrics if any checks were registered."""
+        if not self._dq_results:
+            return
+        total = len(self._dq_results)
+        passed = sum(1 for r in self._dq_results if r["passed"])
+        self.business_metrics.update(
+            {
+                "dq_checks_total": total,
+                "dq_checks_passed": passed,
+                "dq_checks_failed": total - passed,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def finish(self, status: Optional[str] = None) -> bool:
         """
@@ -558,6 +936,9 @@ class RunTracker:
                 error_type = None
                 error_message = None
 
+            # Flush DQ summary into business_metrics before building the record
+            self._flush_dq_summary()
+
             record = self.context.build_record(
                 status=self.status,
                 source_name=self.source_name,
@@ -590,9 +971,13 @@ class RunTracker:
                 sanitize_error_message(tracker_error),
             )
 
-        # Return False to let Python handle business exceptions normally (or complete cleanly)
+        # Return False to let Python propagate business exceptions normally
         return False
 
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
 def run_tracking(
     spark=None,
