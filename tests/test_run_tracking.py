@@ -2,7 +2,7 @@ import json
 import unittest
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from run_tracking import (
     RunContext,
@@ -18,7 +18,52 @@ from run_tracking import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_tracker(pipeline_name, **kwargs):
+    """
+    Build a RunTracker with a real mock Spark session and default test
+    options.  Always disables runtime-metadata collection and
+    verify_write so tests only need to patch append_run_record.
+    Pass verify_write=True explicitly when a test needs the verify path.
+    """
+    defaults = dict(
+        spark=MagicMock(),
+        snowflake_options={"sfURL": "test.snowflakecomputing.com"},
+        pipeline_name=pipeline_name,
+        collect_runtime_metadata=False,
+        verify_write=False,
+    )
+    defaults.update(kwargs)
+    return run_tracking(**defaults)
+
+
+def _write_patches():
+    """
+    Return a context-manager pair that makes both the append and the
+    verify calls succeed without hitting Snowflake or PySpark.
+
+    Usage:
+        with _write_patches() as (mock_append, mock_verify):
+            tracker = run_tracking(...)
+            tracker.finish()
+            record = mock_append.call_args[1]["record"]
+    """
+    return patch.multiple(
+        "run_tracking",
+        append_run_record=MagicMock(return_value=None),
+        verify_run_record=MagicMock(return_value=1),
+    )
+
+
 class RunTrackingTests(unittest.TestCase):
+
+    # -----------------------------------------------------------------------
+    # Pure-function / utility tests — never touched Snowflake
+    # -----------------------------------------------------------------------
+
     def test_dynamic_integer_values(self):
         self.assertEqual(parse_optional_int("2"), 2)
         self.assertIsNone(parse_optional_int(""))
@@ -40,6 +85,11 @@ class RunTrackingTests(unittest.TestCase):
         self.assertIn("[REDACTED]", message)
 
     def test_business_metrics_are_stable_json(self):
+        """
+        Decimal values are serialised as their exact string representation
+        (not float) to avoid losing precision on financial metrics.
+        Dates become ISO-8601 strings.
+        """
         value = metrics_to_json(
             {
                 "distinct_employees": Decimal("125"),
@@ -47,7 +97,8 @@ class RunTrackingTests(unittest.TestCase):
             }
         )
         decoded = json.loads(value)
-        self.assertEqual(decoded["distinct_employees"], 125.0)
+        # Decimal -> str (exact representation, precision-safe)
+        self.assertEqual(decoded["distinct_employees"], "125")
         self.assertEqual(decoded["period"], "2026-08-01")
 
     def test_run_record_calculates_duration_and_target_delta(self):
@@ -93,172 +144,204 @@ class RunTrackingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             context.build_record(status="SUCCEEDED", source_rows=Decimal("1.5"))
 
-    def test_run_tracker_context_manager_success(self):
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
+    # -----------------------------------------------------------------------
+    # RunTracker — write path (patch append_run_record + verify_run_record)
+    # -----------------------------------------------------------------------
 
-        with patch("run_tracking.append_run_record_safely") as mock_append:
+    def test_run_tracker_context_manager_success(self):
+        """
+        Context-manager form records SUCCEEDED with correct field values.
+        The write path calls append_run_record (not append_run_record_safely).
+        """
+        with patch("run_tracking.append_run_record") as mock_append, \
+             patch("run_tracking.verify_run_record", return_value=1):
+
             with run_tracking(
-                spark=mock_spark,
-                snowflake_options=mock_sf_options,
+                spark=MagicMock(),
+                snowflake_options={"sfURL": "test.snowflakecomputing.com"},
                 pipeline_name="UNIT_TEST_PIPELINE",
                 table_name="PRD_MDP.MDP_STG.PIPELINE_RUNS",
+                collect_runtime_metadata=False,
             ) as tracker:
                 tracker.source_rows = 100
                 tracker.transformed_rows = 95
                 tracker.set_metrics(custom_key="custom_value")
 
-            mock_append.assert_called_once()
-            record = mock_append.call_args[1]["record"]
-            self.assertEqual(record["STATUS"], "SUCCEEDED")
-            self.assertEqual(record["PIPELINE_NAME"], "UNIT_TEST_PIPELINE")
-            self.assertEqual(record["SOURCE_ROWS"], 100)
-            self.assertEqual(record["TRANSFORMED_ROWS"], 95)
-            self.assertIn("custom_key", record["BUSINESS_METRICS_JSON"])
+        mock_append.assert_called_once()
+        record = mock_append.call_args[1]["record"]
+        self.assertEqual(record["STATUS"], "SUCCEEDED")
+        self.assertEqual(record["PIPELINE_NAME"], "UNIT_TEST_PIPELINE")
+        self.assertEqual(record["SOURCE_ROWS"], 100)
+        self.assertEqual(record["TRANSFORMED_ROWS"], 95)
+        self.assertIn("custom_key", record["BUSINESS_METRICS_JSON"])
 
     def test_run_tracker_finish_method(self):
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
+        """
+        finish() returns True when the append and verify both succeed.
+        """
+        with patch("run_tracking.append_run_record") as mock_append, \
+             patch("run_tracking.verify_run_record", return_value=1):
 
-        with patch("run_tracking.append_run_record_safely") as mock_append:
             tracker = run_tracking(
-                spark=mock_spark,
-                snowflake_options=mock_sf_options,
+                spark=MagicMock(),
+                snowflake_options={"sfURL": "test.snowflakecomputing.com"},
                 pipeline_name="FINISH_TEST_PIPELINE",
+                collect_runtime_metadata=False,
             )
             tracker.source_rows = 500
             result = tracker.finish()
 
-            self.assertTrue(result)
-            mock_append.assert_called_once()
-            record = mock_append.call_args[1]["record"]
-            self.assertEqual(record["STATUS"], "SUCCEEDED")
-            self.assertEqual(record["SOURCE_ROWS"], 500)
+        self.assertTrue(result)
+        mock_append.assert_called_once()
+        record = mock_append.call_args[1]["record"]
+        self.assertEqual(record["STATUS"], "SUCCEEDED")
+        self.assertEqual(record["SOURCE_ROWS"], 500)
 
     def test_run_tracker_context_manager_failure_reraises(self):
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
+        """
+        An unhandled exception inside `with` sets STATUS=FAILED and
+        re-raises the original exception after writing the record.
+        """
+        with patch("run_tracking.append_run_record") as mock_append, \
+             patch("run_tracking.verify_run_record", return_value=1):
 
-        with patch("run_tracking.append_run_record_safely") as mock_append:
             with self.assertRaises(ZeroDivisionError):
                 with run_tracking(
-                    spark=mock_spark,
-                    snowflake_options=mock_sf_options,
+                    spark=MagicMock(),
+                    snowflake_options={"sfURL": "test.snowflakecomputing.com"},
                     pipeline_name="FAILING_PIPELINE",
-                ) as tracker:
+                    collect_runtime_metadata=False,
+                ):
                     _ = 1 / 0
 
-            mock_append.assert_called_once()
-            record = mock_append.call_args[1]["record"]
-            self.assertEqual(record["STATUS"], "FAILED")
-            self.assertEqual(record["ERROR_TYPE"], "ZeroDivisionError")
-            self.assertIn("division by zero", record["ERROR_MESSAGE"])
+        mock_append.assert_called_once()
+        record = mock_append.call_args[1]["record"]
+        self.assertEqual(record["STATUS"], "FAILED")
+        self.assertEqual(record["ERROR_TYPE"], "ZeroDivisionError")
+        self.assertIn("division by zero", record["ERROR_MESSAGE"])
 
     def test_telemetry_failure_does_not_crash_pipeline(self):
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
-
-        with patch("run_tracking.append_run_record", side_effect=RuntimeError("Snowflake down")):
+        """
+        When append_run_record raises and raise_on_failure=False (default),
+        finish() must return False — not raise.  The pipeline code after
+        tracker.finish() continues to execute normally.
+        """
+        with patch(
+            "run_tracking.append_run_record",
+            side_effect=RuntimeError("Snowflake down"),
+        ):
             tracker = run_tracking(
-                spark=mock_spark,
-                snowflake_options=mock_sf_options,
+                spark=MagicMock(),
+                snowflake_options={"sfURL": "test.snowflakecomputing.com"},
                 pipeline_name="RESILIENCE_TEST",
+                collect_runtime_metadata=False,
             )
-            # Should log error and return safely without throwing
-            res = tracker.finish()
-            self.assertTrue(res)
+            # Must not raise
+            result = tracker.finish()
+
+        # Write failed → False, but no exception propagated
+        self.assertFalse(result)
+        self.assertIsNotNone(tracker.tracking_error)
+
+    def test_telemetry_failure_raises_when_raise_on_failure_true(self):
+        """
+        When raise_on_failure=True, a write failure propagates as an exception.
+        """
+        with patch(
+            "run_tracking.append_run_record",
+            side_effect=RuntimeError("Snowflake down"),
+        ):
+            tracker = run_tracking(
+                spark=MagicMock(),
+                snowflake_options={"sfURL": "test.snowflakecomputing.com"},
+                pipeline_name="RAISE_TEST",
+                collect_runtime_metadata=False,
+                raise_on_failure=True,
+            )
+            with self.assertRaises(RuntimeError):
+                tracker.finish()
 
     def test_lean_run_tracking_without_row_counts(self):
-        """Verify lean run tracking populates execution details while defaulting row counts to None (NULL)."""
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
+        """
+        Row counts default to NULL when not explicitly assigned.
+        Execution metadata (RUN_ID, timestamps, duration) is always present.
+        """
+        with patch("run_tracking.append_run_record") as mock_append, \
+             patch("run_tracking.verify_run_record", return_value=1):
 
-        with patch("run_tracking.append_run_record_safely") as mock_append:
             with run_tracking(
-                spark=mock_spark,
-                snowflake_options=mock_sf_options,
+                spark=MagicMock(),
+                snowflake_options={"sfURL": "test.snowflakecomputing.com"},
                 pipeline_name="LEAN_TRACKING_PIPELINE",
+                collect_runtime_metadata=False,
             ) as tracker:
-                # No row counts assigned intentionally
-                pass
+                pass  # No row counts assigned
 
-            mock_append.assert_called_once()
-            record = mock_append.call_args[1]["record"]
-            self.assertEqual(record["STATUS"], "SUCCEEDED")
-            self.assertEqual(record["PIPELINE_NAME"], "LEAN_TRACKING_PIPELINE")
-            self.assertIsNotNone(record["RUN_ID"])
-            self.assertIsNotNone(record["STARTED_AT_UTC"])
-            self.assertIsNotNone(record["COMPLETED_AT_UTC"])
-            self.assertGreaterEqual(record["DURATION_SECONDS"], 0.0)
+        mock_append.assert_called_once()
+        record = mock_append.call_args[1]["record"]
+        self.assertEqual(record["STATUS"], "SUCCEEDED")
+        self.assertEqual(record["PIPELINE_NAME"], "LEAN_TRACKING_PIPELINE")
+        self.assertIsNotNone(record["RUN_ID"])
+        self.assertIsNotNone(record["STARTED_AT_UTC"])
+        self.assertIsNotNone(record["COMPLETED_AT_UTC"])
+        self.assertGreaterEqual(record["DURATION_SECONDS"], 0.0)
 
-            # Ensure row counts default to None (NULL in database)
-            self.assertIsNone(record["SOURCE_ROWS"])
-            self.assertIsNone(record["STAGING_ROWS"])
-            self.assertIsNone(record["TRANSFORMED_ROWS"])
-            self.assertIsNone(record["TARGET_ROWS_BEFORE"])
-            self.assertIsNone(record["TARGET_ROWS_AFTER"])
-            self.assertIsNone(record["TARGET_ROW_DELTA"])
+        # Row counts must be NULL
+        for field in (
+            "SOURCE_ROWS",
+            "STAGING_ROWS",
+            "TRANSFORMED_ROWS",
+            "TARGET_ROWS_BEFORE",
+            "TARGET_ROWS_AFTER",
+            "TARGET_ROW_DELTA",
+        ):
+            self.assertIsNone(record[field])
 
+    # -----------------------------------------------------------------------
+    # BUSINESS_METRICS_JSON extensibility
+    # -----------------------------------------------------------------------
 
     def test_add_metrics_merges_into_business_metrics_json(self):
         """add_metrics() dict is serialized into BUSINESS_METRICS_JSON."""
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
+        with patch("run_tracking.append_run_record") as mock_append, \
+             patch("run_tracking.verify_run_record", return_value=1):
 
-        with patch("run_tracking.append_run_record_safely") as mock_append:
-            tracker = run_tracking(
-                spark=mock_spark,
-                snowflake_options=mock_sf_options,
-                pipeline_name="ADD_METRICS_TEST",
-                collect_runtime_metadata=False,
+            tracker = _make_tracker("ADD_METRICS_TEST")
+            tracker.add_metrics(
+                {"source_row_count": 10000, "reconciliation_status": "PASS"}
             )
-            tracker.add_metrics({"source_row_count": 10000, "reconciliation_status": "PASS"})
             tracker.finish()
 
-            record = mock_append.call_args[1]["record"]
-            payload = json.loads(record["BUSINESS_METRICS_JSON"])
-            self.assertEqual(payload["source_row_count"], 10000)
-            self.assertEqual(payload["reconciliation_status"], "PASS")
+        record = mock_append.call_args[1]["record"]
+        payload = json.loads(record["BUSINESS_METRICS_JSON"])
+        self.assertEqual(payload["source_row_count"], 10000)
+        self.assertEqual(payload["reconciliation_status"], "PASS")
 
     def test_dq_checks_summary_written_to_business_metrics_json(self):
-        """DQ check results are aggregated and stored in BUSINESS_METRICS_JSON."""
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
+        """DQ check aggregate counts land in BUSINESS_METRICS_JSON at finish()."""
+        with patch("run_tracking.append_run_record") as mock_append, \
+             patch("run_tracking.verify_run_record", return_value=1):
 
-        with patch("run_tracking.append_run_record_safely") as mock_append:
-            tracker = run_tracking(
-                spark=mock_spark,
-                snowflake_options=mock_sf_options,
-                pipeline_name="DQ_TEST_PIPELINE",
-                collect_runtime_metadata=False,
-            )
+            tracker = _make_tracker("DQ_TEST_PIPELINE")
             tracker.check(True,  "no_negative_kilos")
             tracker.check(True,  "no_null_ids")
-            tracker.check(False, "duplicate_check")  # one failure
+            tracker.check(False, "duplicate_check")   # one failure
             tracker.finish()
 
-            record = mock_append.call_args[1]["record"]
-            payload = json.loads(record["BUSINESS_METRICS_JSON"])
-            self.assertEqual(payload["dq_checks_total"],  3)
-            self.assertEqual(payload["dq_checks_passed"], 2)
-            self.assertEqual(payload["dq_checks_failed"], 1)
+        record = mock_append.call_args[1]["record"]
+        payload = json.loads(record["BUSINESS_METRICS_JSON"])
+        self.assertEqual(payload["dq_checks_total"],  3)
+        self.assertEqual(payload["dq_checks_passed"], 2)
+        self.assertEqual(payload["dq_checks_failed"], 1)
 
     def test_check_returns_condition_value(self):
-        """check() must return the boolean it received so callers can branch on it."""
-        mock_spark = MagicMock()
-        tracker = run_tracking(
-            spark=mock_spark,
-            pipeline_name="CHECK_RETURN_TEST",
-            collect_runtime_metadata=False,
-        )
+        """check() must return the boolean it received so callers can branch."""
+        tracker = _make_tracker("CHECK_RETURN_TEST")
         self.assertTrue(tracker.check(True,  "passing_check"))
         self.assertFalse(tracker.check(False, "failing_check"))
 
     def test_profile_returns_expected_keys(self):
         """profile() builds the correct metric keys from a mocked DataFrame."""
-        from unittest.mock import MagicMock
-
-        # Build a minimal mock that satisfies the PySpark agg/groupBy chain
         mock_agg_row = MagicMock()
         mock_agg_row.asDict.return_value = {
             "__row_count": 500,
@@ -269,7 +352,9 @@ class RunTrackingTests(unittest.TestCase):
         mock_agg_df.first.return_value = mock_agg_row
 
         mock_dup_df = MagicMock()
-        mock_dup_df.filter.return_value = MagicMock(count=MagicMock(return_value=2))
+        mock_dup_df.filter.return_value = MagicMock(
+            count=MagicMock(return_value=2)
+        )
 
         mock_df = MagicMock()
         mock_df.agg.return_value = mock_agg_df
@@ -277,20 +362,22 @@ class RunTrackingTests(unittest.TestCase):
             count=MagicMock(return_value=mock_dup_df)
         )
 
-        mock_spark = MagicMock()
-        tracker = run_tracking(
-            spark=mock_spark,
-            pipeline_name="PROFILE_TEST",
-            collect_runtime_metadata=False,
+        tracker = _make_tracker("PROFILE_TEST")
+
+        pyspark_mock = MagicMock()
+        pyspark_mock.sql.functions.count.return_value = MagicMock(
+            alias=MagicMock(return_value=MagicMock())
         )
 
-        import sys
-        pyspark_mock = MagicMock()
-        pyspark_mock.sql.functions.count.return_value = MagicMock(alias=MagicMock(return_value=MagicMock()))
-
         result = {}
-        with patch.dict("sys.modules", {"pyspark": pyspark_mock, "pyspark.sql": pyspark_mock.sql, "pyspark.sql.functions": pyspark_mock.sql.functions}):
-            # profile() should not raise even if PySpark internals differ
+        with patch.dict(
+            "sys.modules",
+            {
+                "pyspark": pyspark_mock,
+                "pyspark.sql": pyspark_mock.sql,
+                "pyspark.sql.functions": pyspark_mock.sql.functions,
+            },
+        ):
             try:
                 result = tracker.profile(
                     mock_df,
@@ -300,38 +387,42 @@ class RunTrackingTests(unittest.TestCase):
                     key_columns=["ID"],
                 )
             except Exception:
-                pass  # Mocking PySpark deeply; just verify the method exists and is callable
+                pass  # Deep PySpark mock; just verify the method is callable
 
         self.assertIsInstance(result, dict)
 
-    def test_collect_runtime_metadata_disabled(self):
-        """collect_runtime_metadata=False must keep BUSINESS_METRICS_JSON clean."""
-        mock_spark = MagicMock()
-        mock_sf_options = {"sfURL": "test.snowflakecomputing.com"}
+    # -----------------------------------------------------------------------
+    # Runtime metadata
+    # -----------------------------------------------------------------------
 
-        with patch("run_tracking.append_run_record_safely") as mock_append:
-            tracker = run_tracking(
-                spark=mock_spark,
-                snowflake_options=mock_sf_options,
-                pipeline_name="NO_META_PIPELINE",
-                collect_runtime_metadata=False,
-            )
+    def test_collect_runtime_metadata_disabled(self):
+        """
+        collect_runtime_metadata=False leaves BUSINESS_METRICS_JSON NULL
+        when no custom metrics are added.
+        """
+        with patch("run_tracking.append_run_record") as mock_append, \
+             patch("run_tracking.verify_run_record", return_value=1):
+
+            tracker = _make_tracker("NO_META_PIPELINE")
             tracker.finish()
 
-            record = mock_append.call_args[1]["record"]
-            # No custom metrics and runtime disabled -> BUSINESS_METRICS_JSON must be NULL
-            self.assertIsNone(record["BUSINESS_METRICS_JSON"])
+        record = mock_append.call_args[1]["record"]
+        self.assertIsNone(record["BUSINESS_METRICS_JSON"])
 
     def test_collect_runtime_metadata_safe_on_mock_spark(self):
         """_collect_runtime_metadata() must not raise on a mock Spark session."""
         meta = _collect_runtime_metadata(spark=MagicMock(), dbutils=None)
         self.assertIsInstance(meta, dict)
 
+    # -----------------------------------------------------------------------
+    # Snowflake session tagging
+    # -----------------------------------------------------------------------
+
     def test_tag_snowflake_session_does_not_raise_on_failure(self):
         """tag_snowflake_session() must be fault-tolerant."""
         bad_spark = MagicMock()
         bad_spark.read.format.side_effect = RuntimeError("Snowflake unreachable")
-        # Should complete without raising
+        # Must not raise
         tag_snowflake_session(
             spark=bad_spark,
             snowflake_options={},
@@ -339,9 +430,54 @@ class RunTrackingTests(unittest.TestCase):
             pipeline_name="TEST",
         )
 
+    # -----------------------------------------------------------------------
+    # get_snowflake_options
+    # -----------------------------------------------------------------------
+
     def test_get_snowflake_options_missing_dbutils(self):
         with self.assertRaises(ValueError):
             get_snowflake_options(None)
+
+    # -----------------------------------------------------------------------
+    # verify_write behaviour
+    # -----------------------------------------------------------------------
+
+    def test_verify_write_false_skips_verification(self):
+        """
+        When verify_write=False, finish() returns True after a successful
+        append without calling verify_run_record at all.
+        """
+        with patch("run_tracking.append_run_record"), \
+             patch("run_tracking.verify_run_record") as mock_verify:
+
+            tracker = _make_tracker("NO_VERIFY_TEST", verify_write=False)
+            result = tracker.finish()
+
+        self.assertTrue(result)
+        mock_verify.assert_not_called()
+
+    def test_write_succeeded_property_true_on_success(self):
+        """tracker.write_succeeded is True after a clean finish()."""
+        with patch("run_tracking.append_run_record"), \
+             patch("run_tracking.verify_run_record", return_value=1):
+
+            tracker = _make_tracker("WRITE_SUCCEEDED_TEST", verify_write=True)
+            tracker.finish()
+
+        self.assertTrue(tracker.write_succeeded)
+        self.assertIsNone(tracker.tracking_error)
+
+    def test_write_succeeded_property_false_on_append_failure(self):
+        """tracker.write_succeeded is False when the append fails."""
+        with patch(
+            "run_tracking.append_run_record",
+            side_effect=RuntimeError("Network error"),
+        ):
+            tracker = _make_tracker("WRITE_FAILED_TEST")
+            tracker.finish()
+
+        self.assertFalse(tracker.write_succeeded)
+        self.assertIsNotNone(tracker.tracking_error)
 
 
 if __name__ == "__main__":
